@@ -10,7 +10,7 @@
  * with the same reload. The type's controls, viewer choice, wrap and reload, sit at the end of
  * the path row; the Sidebar's strip carries none of them.
  */
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode, RefObject } from 'react'
 import clsx from 'clsx'
 import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
@@ -24,8 +24,9 @@ import { LoadingIndicator } from './LoadingIndicator.tsx'
 import { hostFileOf } from './rpc.ts'
 import type { TextStore } from './store.ts'
 import type { DocumentContent } from './document/contract.ts'
-import { matchingDocumentPreviews } from './document/registry.ts'
+import { binaryDocumentPath, matchingDocumentPreviews } from './document/registry.ts'
 import type { DocumentPreviewDefinition } from './document/registry.ts'
+import { unviewableBinaryPath } from './document/unviewable.ts'
 import { PLAIN_BODY_ID } from './text/index.ts'
 import { loadedPages, lastLineLoaded, scrollToLine } from './text/lines.ts'
 import css from './TextPreview.module.css'
@@ -54,6 +55,23 @@ function usePathClipped(
     observer?.observe(inner)
     return () => { observer?.disconnect() }
   }, [box, text, path, shown])
+}
+
+/** The header's path: directories greyed, the final segment in full ink, faded when clipped. */
+function HeaderPath({ pathRef, pathTextRef, path }: {
+  pathRef: RefObject<HTMLDivElement>
+  pathTextRef: RefObject<HTMLSpanElement>
+  path: string
+}): ReactNode {
+  const { directory, name } = pathPartsOf(path)
+  return (
+    <div ref={pathRef} className={css.path} title={path} data-textpreview-path>
+      <span ref={pathTextRef} className={css.pathText}>
+        {directory !== '' && <span className={css.pathDirectory}>{directory}</span>}
+        <span className={css.pathName}>{name}</span>
+      </span>
+    </div>
+  )
 }
 
 /** Private registration inputs; the framework binds the registry source to useDocumentPreviews. */
@@ -85,15 +103,20 @@ export function TextPreview({
   const file = useMemo(() => hostFileOf(tab.contentId), [tab.contentId])
   const state = useStore(s => s.byTab[tab.id])
   const definitions = useDocumentPreviews(value => value)
+  const unviewable = useMemo(() => unviewableBinaryPath(file.path), [file.path])
   const candidates = useMemo(() => {
     const matched = matchingDocumentPreviews(definitions, file.path)
+    if (matched.length > 0 && binaryDocumentPath(definitions, file.path)) return matched
+    if (matched.length === 0 && unviewable) return matched
     const fallback = definitions.find(definition => definition.id === PLAIN_BODY_ID)
     return fallback === undefined ? matched : [...matched, fallback]
-  }, [definitions, file.path])
+  }, [definitions, file.path, unviewable])
   const selected = candidates.find(candidate => candidate.id === state?.rendererId) ?? candidates[0]
   const mode = selected?.loading
   const current = (state?.mode ?? 'text-pages') === mode ? state : undefined
   const bodyRef = useRef<HTMLDivElement | null>(null)
+  const scrollportRef = useRef<HTMLElement | null>(null)
+  const storedScrollTopRef = useRef(0)
   const pathRef = useRef<HTMLDivElement | null>(null)
   const pathTextRef = useRef<HTMLSpanElement | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -106,6 +129,17 @@ export function TextPreview({
   const loaded = useMemo(() => loadedPages(pages ?? {}), [pages])
   const loadedThrough = lastLineLoaded(loaded)
   const hasContent = loaded.length > 0 || current?.complete !== undefined
+  storedScrollTopRef.current = state?.scrollTop ?? 0
+  const bindBody = useCallback((body: HTMLDivElement | null): void => {
+    const previous = bodyRef.current
+    bodyRef.current = body
+    if (scrollportRef.current === null || scrollportRef.current === previous) scrollportRef.current = body
+  }, [])
+  const bindScrollport = useCallback((scrollport: HTMLElement | null): void => {
+    const next = scrollport ?? bodyRef.current
+    scrollportRef.current = next
+    if (next !== null) next.scrollTop = storedScrollTopRef.current
+  }, [])
 
   // First mount reads the first page; a body coming back to a tab with content
   // reads nothing, because the store outlives the body.
@@ -117,19 +151,19 @@ export function TextPreview({
   }, [started, tab.id, file, signal, loadPage, loadAll, canRead, mode, meta.value?.version])
 
   // Come back where the reader was once there is content to scroll: on a remount,
-  // and after a reload rebuilt the content. Keyed on content presence only, so a
-  // scroll write never re-lands.
+  // after a reload rebuilt the content, or after the selected renderer changed.
+  // Scroll writes preserve both identities, so they never re-land.
   useEffect(() => {
-    const body = bodyRef.current
+    const body = scrollportRef.current
     if (hasContent && body !== null && state !== undefined) body.scrollTop = state.scrollTop
-  }, [hasContent])
+  }, [hasContent, selected?.id])
 
   // Answer a navigation once: a line the pages do not reach yet loads the next
   // page (again, until the pages cover it or the file ends); a line they hold
   // is scrolled to and marked. The store remembers the answer, so a remount
   // restores the reader's place instead.
   useEffect(() => {
-    const body = bodyRef.current
+    const body = scrollportRef.current
     if (current === undefined || body === null || current.revision === navigation.revision) return
     if (line === undefined || mode !== 'text-pages') {
       actions.navigated(tab.id, navigation.revision)
@@ -160,6 +194,24 @@ export function TextPreview({
     return { kind: 'text', pages: loaded, text: loaded.filter(page => page.lines > 0).map(page => page.text).join('\n'), eof: current.eof }
   }, [mode, loaded, current?.complete, current?.eof])
 
+  // A known binary suffix with no matching renderer never reads: no plain-text
+  // fallback, no viewer control, only the path and the unsupported line.
+  if (selected === undefined && unviewable) {
+    const { name: unsupportedName } = pathPartsOf(displayPath)
+    return (
+      <div className={css.preview} data-textpreview-state="unsupported" data-textpreview-url={tab.contentId}>
+        <div className={css.header}>
+          <HeaderPath pathRef={pathRef} pathTextRef={pathTextRef} path={displayPath} />
+        </div>
+        <div className={css.body} data-textpreview-body>
+          <div className={css.empty} data-textpreview-unsupported>
+            <FileTypeIcon kind={classifyFileType(unsupportedName)} size={36} className={css.emptyIcon} />
+            <p className={css.emptyLine}>{t('unsupportedFile')}</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
   if (state === undefined || selected === undefined) {
     return (
       <div className={css.status} data-textpreview-state="loading">
@@ -170,7 +222,7 @@ export function TextPreview({
     )
   }
   const next = loadedThrough + 1
-  const { directory, name } = pathPartsOf(displayPath)
+  const { name } = pathPartsOf(displayPath)
   const observedVersion = meta.value?.version
   const changed = current?.version !== undefined && observedVersion !== undefined
     && observedVersion !== current.version && observedVersion !== current.observedVersion
@@ -217,27 +269,25 @@ export function TextPreview({
           </p>
         )}
       <div className={css.header}>
-        <div ref={pathRef} className={css.path} title={displayPath} data-textpreview-path>
-          <span ref={pathTextRef} className={css.pathText}>
-            {directory !== '' && <span className={css.pathDirectory}>{directory}</span>}
-            <span className={css.pathName}>{name}</span>
-          </span>
-        </div>
-        <Menu
-          open={menuOpen}
-          anchor={(
-            <button type="button" className={clsx(css.tool, css.viewerTool)} aria-label={t('openWith')} title={selected.title()} data-document-viewer-menu onClick={() => { setMenuOpen(value => !value) }}>
-              {selected.title()}
-            </button>
+        <HeaderPath pathRef={pathRef} pathTextRef={pathTextRef} path={displayPath} />
+        {candidates.length > 1
+          && (
+            <Menu
+              open={menuOpen}
+              anchor={(
+                <button type="button" className={clsx(css.tool, css.viewerTool)} aria-label={t('openWith')} title={selected.title()} data-document-viewer-menu onClick={() => { setMenuOpen(value => !value) }}>
+                  {selected.title()}
+                </button>
+              )}
+              items={candidates.map(candidate => ({ id: candidate.id, label: candidate.title() }))}
+              selectedId={selected.id}
+              onSelect={(id) => { actions.selected(tab.id, id); setMenuOpen(false) }}
+              onClose={() => { setMenuOpen(false) }}
+              align="end"
+              portal
+              dense
+            />
           )}
-          items={candidates.map(candidate => ({ id: candidate.id, label: candidate.title() }))}
-          selectedId={selected.id}
-          onSelect={(id) => { actions.selected(tab.id, id); setMenuOpen(false) }}
-          onClose={() => { setMenuOpen(false) }}
-          align="end"
-          portal
-          dense
-        />
         {selected.wrap === true && (
           // The tooltip names the action while the stable aria name and
           // `aria-pressed` expose the control and its current state.
@@ -267,22 +317,25 @@ export function TextPreview({
         </Tooltip>
       </div>
       <div
-        ref={bodyRef}
+        ref={bindBody}
         className={clsx(css.body, state.wrap && css.wrap)}
         data-textpreview-body
         data-textpreview-wrap={state.wrap ? '' : undefined}
-        onScroll={(event) => {
-          const body = event.currentTarget
+        onScrollCapture={(event) => {
+          const body = scrollportRef.current
+          /* v8 ignore next -- callback refs bind the scrollport during commit, before user input. */
+          if (body === null) return
+          if (event.target !== body) return
           actions.scrolled(tab.id, body.scrollTop)
           if (mode === 'text-pages' && current?.failure === undefined && body.clientHeight > 0
             && body.scrollTop + body.clientHeight >= body.scrollHeight - 1) loadNext()
         }}
       >
         {!hasContent && current?.failure === undefined && (
-          <LoadingIndicator className={css.statusLine} label={t('loading')} />
+          <LoadingIndicator className={clsx(css.statusLine, css.bodyLoading)} label={t('loading')} />
         )}
         {content !== undefined && renderSlot('sidebar.right.tab.document', {
-          resourceAddress: tab.contentId, content, wrap: state.wrap,
+          resourceAddress: tab.contentId, content, wrap: state.wrap, scrollportRef: bindScrollport,
         }, {
           entryKey: selected.id, hookContext: useTabInfo,
           fallback: <p className={css.statusLine}>{t('rendererUnavailable', { name: selected.title() })}</p>,

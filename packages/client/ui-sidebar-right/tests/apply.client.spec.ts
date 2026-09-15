@@ -95,7 +95,7 @@ describe('ui-sidebar-right apply', () => {
     expect(guide?.title('sidebar://guide')).toBe('tab.guide.title')
     // Five registrations: the root and panel seats, the header's corner seat,
     // and the guide body and chip title under the guide implementation's id.
-    // The guide binds no dictionary: its only words are the entries' own.
+    // The guide draws no product copy of its own, so neither guide seat binds the dictionary.
     expect(registered.map(entry => [entry.name, entry.key, entry.locale, entry.component])).toEqual([
       ['rightbar', undefined, undefined, RightbarRoot],
       ['rightbar.session', undefined, 'sidebarRight', RightbarSeat],
@@ -179,7 +179,7 @@ describe('ui-sidebar-right apply', () => {
       id: 'spec/files',
       kind: 'files',
       title: () => 'Files',
-      guide: [{ order: 10, title: () => 'Files' }],
+      guide: [{ id: 'default', order: 10, title: () => 'Files' }],
     })
     expect(seen).toHaveBeenCalledOnce()
     expect(guideEntries.getSnapshot().map(entry => entry.kind)).toEqual(['files'])
